@@ -3,7 +3,7 @@ services:
     image: nginx:latest
     container_name: nginx-lb
     ports:
-        - "8080:80"
+        - "8844:80"
         - "8443:443"
     networks:
       - lb-network

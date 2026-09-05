@@ -252,3 +252,87 @@ jobs:
         # `always()` runs this even on failure or cancellation.
         if: always()
         run: docker compose down -v
+
+  # ==========================================================
+  # JOB 4 — publish images to GHCR
+  # ==========================================================
+  # The integration job builds all five images, proves the stack
+  # works, then throws them away with `compose down -v` — and the
+  # runner VM goes with them. A green run left nothing behind you
+  # could actually deploy. This job is what makes the tested
+  # artifact outlive the run.
+  #
+  # It rebuilds rather than reusing the integration job's images:
+  # every job gets a fresh VM, so those tags do not exist here.
+  # Passing them across as artifacts costs more (save/upload/
+  # download/load a tarball) than rebuilding five small Node
+  # images from a warm layer cache.
+  publish:
+    name: publish (${{ matrix.image }})
+    runs-on: ubuntu-latest
+    needs: [integration]  # never publish an image the stack test rejected
+
+    # Only real merges to main. Without this guard a PR — including
+    # one from a fork — could push over your tags.
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+
+    permissions:
+      contents: read
+      packages: write  # scoped to THIS job, so PR runs never hold a write token
+
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - context: load-balancer
+            image: load-balancer
+          - context: services-instance/node-1
+            image: node-1
+          - context: services-instance/node-2
+            image: node-2
+          - context: services-instance/node-3
+            image: node-3
+          - context: services-instance/node-4
+            image: node-4
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Log in to GHCR
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          # Built into every run. No repo secret to create or rotate.
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Build the image path
+        # GHCR rejects any uppercase in a repository path, but
+        # github.repository preserves the owner's casing. Lowercasing
+        # here costs one line and avoids an "invalid reference format"
+        # failure if this repo is ever renamed or transferred.
+        id: ref
+        run: |
+          repo=$(echo "${{ github.repository }}" | tr '[:upper:]' '[:lower:]')
+          echo "path=ghcr.io/${repo}/${{ matrix.image }}" >> "$GITHUB_OUTPUT"
+
+      - name: Build and push
+        # Two tags on one build. The SHA tag is the real identity —
+        # it says exactly which commit is running, and it is what
+        # makes a rollback possible. `latest` is a moving convenience
+        # pointer; never deploy from it.
+        run: |
+          docker build \
+            -t "${{ steps.ref.outputs.path }}:${{ github.sha }}" \
+            -t "${{ steps.ref.outputs.path }}:latest" \
+            "./${{ matrix.context }}"
+
+          docker push "${{ steps.ref.outputs.path }}:${{ github.sha }}"
+          docker push "${{ steps.ref.outputs.path }}:latest"
+
+      - name: Summary
+        # Puts the pullable ref on the run's summary page, so you are
+        # not digging through logs to find what was published.
+        run: |
+          echo "Pushed \`${{ steps.ref.outputs.path }}:${{ github.sha }}\`" >> "$GITHUB_STEP_SUMMARY"
