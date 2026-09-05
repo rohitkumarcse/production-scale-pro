@@ -109,10 +109,26 @@ services:
     networks:
       - lb-network
     depends_on:
-      - node-1
-      - node-2
-      - node-3
-      - node-4
+      # Start only once the backends actually answer. Plain
+      # `- node-1` waits for the container to start, not for the
+      # app inside it to be listening.
+      node-1:
+        condition: service_healthy
+      node-2:
+        condition: service_healthy
+      node-3:
+        condition: service_healthy
+      node-4:
+        condition: service_healthy
+    # The component whose death takes down everything needs this
+    # at least as much as the backends do.
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "node", "-e", "require('http').get('http://localhost:3000/',r=>process.exit(r.statusCode===200?0:1)).on('error',()=>process.exit(1))"]
+      interval: 10s
+      timeout: 3s
+      retries: 3
+      start_period: 15s
 
 networks:
   lb-network:

@@ -125,14 +125,35 @@ jobs:
       - name: Wait for the balancer to accept traffic
         # The load-balancer service has no healthcheck, so poll it.
         run: |
-          for i in $(seq 1 30); do
-            if curl -fsS -m 2 http://localhost:3000/ >/dev/null 2>&1; then
+          for i in $(seq 1 40); do
+            # Capture the actual status instead of using `curl -f`,
+            # which reports a refused connection and an HTTP 503
+            # as the same opaque failure.
+            code=$(curl -s -o /dev/null -w '%{http_code}' -m 3 http://localhost:3000/ || echo 000)
+
+            if [ "$code" = "200" ]; then
               echo "balancer up after ${i}s"
               exit 0
             fi
+
+            # 000 = nothing listening. 503 = up, but it thinks every
+            # backend is down. Print the transition, not every tick.
+            [ "$code" != "$last" ] && echo "t=${i}s status=$code"
+            last=$code
             sleep 1
           done
-          echo "::error::balancer never responded on :3000"
+
+          echo "::error::balancer never returned 200 on :3000 (last status: $last)"
+          echo "--- container states ---"
+          docker compose ps
+          echo "--- load-balancer logs ---"
+          docker logs load-balancer --tail 50 2>&1 || echo "container has no logs / does not exist"
+          echo "--- can the LB resolve its backends? ---"
+          docker exec load-balancer node -e "
+            require('http').get('http://node-1:3001/health', r => {
+              console.log('node-1:3001 ->', r.statusCode);
+            }).on('error', e => console.log('node-1:3001 ->', e.code));
+          " 2>&1 || echo "exec failed — container not running"
           exit 1
 
       - name: Balancer returns 200
