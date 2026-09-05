@@ -1,17 +1,40 @@
 name: CI
 
+# WHEN this pipeline runs.
 on:
   push:
-    branches:
-      - main
-
+    branches: [main]
   pull_request:
-    branches:
-      - main
+    branches: [main]
+
+# Cancel an in-progress run when you push again to the same branch,
+# so you are not paying for CI on code you already replaced.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
 
 jobs:
-  test:
+  # ==========================================================
+  # JOB 1 — per-package checks
+  # ==========================================================
+  # There is no package.json at the repo root, so there is no
+  # single `npm ci` that works. A matrix runs these five packages
+  # in parallel, each on its own runner.
+  check:
+    name: check (${{ matrix.package }})
     runs-on: ubuntu-latest
+
+    strategy:
+      # Don't cancel the other four when one fails — you want to
+      # see every failure in one run, not discover them one by one.
+      fail-fast: false
+      matrix:
+        package:
+          - load-balancer
+          - services-instance/node-1
+          - services-instance/node-2
+          - services-instance/node-3
+          - services-instance/node-4
 
     steps:
       - name: Checkout
@@ -20,14 +43,161 @@ jobs:
       - name: Setup Node.js
         uses: actions/setup-node@v4
         with:
-          node-version: 20
+          node-version: 22
           cache: npm
+          # The cache needs to know WHICH lockfile to hash.
+          # Without this it looks in the repo root and finds nothing.
+          cache-dependency-path: ${{ matrix.package }}/package-lock.json
 
       - name: Install dependencies
+        working-directory: ${{ matrix.package }}
         run: npm ci
 
-      - name: Run tests
-        run: npm test
+      - name: Check syntax
+        working-directory: ${{ matrix.package }}
+        # `node --check` parses a file without executing it.
+        # A placeholder until there are real tests — it catches
+        # typos and broken edits, nothing more. Replace with
+        # `npm test` once you have a test script.
+        run: |
+          find . -name '*.js' -not -path './node_modules/*' -print0 \
+            | xargs -0 -n1 node --check
 
-      - name: Build verification
-        run: npm run build --if-present
+      - name: Audit dependencies
+        working-directory: ${{ matrix.package }}
+        # Reports known CVEs. `|| true` means it informs without
+        # blocking — drop that once the report is clean.
+        run: npm audit --audit-level=high || true
+
+  # ==========================================================
+  # JOB 2 — build images and test the whole stack
+  # ==========================================================
+  # Build and integration live in ONE job on purpose. Every job
+  # gets a fresh VM, so images built in another job would not
+  # exist here. Moving them apart means uploading images as
+  # artifacts — not worth it at this size.
+  integration:
+    name: integration
+    runs-on: ubuntu-latest
+    needs: check          # only runs if all five checks passed
+    timeout-minutes: 15   # a hung compose stack should fail, not run forever
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Build images
+        # docker-compose.yml references pre-built tags (image: node-1:latest)
+        # rather than build: contexts, so the tags must exist first.
+        run: |
+          docker build -t load-balancer:latest ./load-balancer
+          for n in 1 2 3 4; do
+            docker build -t node-$n:latest ./services-instance/node-$n
+          done
+
+      - name: Start stack
+        # nginx is excluded deliberately: it needs ssl/nginx.crt,
+        # and ssl/ is gitignored, so those certs do not exist on a
+        # fresh checkout. Naming services explicitly also skips
+        # anything else that needs local-only files.
+        run: |
+          docker compose up -d \
+            mongodb node-1 node-2 node-3 node-4 load-balancer
+
+      - name: Wait for backends to report healthy
+        run: |
+          for i in $(seq 1 45); do
+            unhealthy=0
+            for c in node-1 node-2 node-3 node-4; do
+              status=$(docker inspect -f '{{.State.Health.Status}}' "$c" 2>/dev/null || echo missing)
+              [ "$status" = healthy ] || unhealthy=1
+            done
+            if [ "$unhealthy" -eq 0 ]; then
+              echo "all backends healthy after ${i}s"
+              exit 0
+            fi
+            sleep 1
+          done
+          echo "::error::backends never became healthy"
+          docker compose ps
+          exit 1
+
+      - name: Wait for the balancer to accept traffic
+        # The load-balancer service has no healthcheck, so poll it.
+        run: |
+          for i in $(seq 1 30); do
+            if curl -fsS -m 2 http://localhost:3000/ >/dev/null 2>&1; then
+              echo "balancer up after ${i}s"
+              exit 0
+            fi
+            sleep 1
+          done
+          echo "::error::balancer never responded on :3000"
+          exit 1
+
+      - name: Balancer returns 200
+        run: |
+          code=$(curl -s -o /dev/null -w '%{http_code}' -m 5 http://localhost:3000/)
+          echo "status=$code"
+          [ "$code" = "200" ] || { echo "::error::expected 200, got $code"; exit 1; }
+
+      - name: Round-robin reaches every registered backend
+        # The real contract of a load balancer: traffic is spread,
+        # not pinned to one node.
+        run: |
+          for i in $(seq 1 15); do
+            curl -s -m 5 http://localhost:3000/ \
+              | grep -o '"server":"[^"]*"'
+          done | sort | uniq -c | tee /tmp/spread.txt
+
+          distinct=$(wc -l < /tmp/spread.txt)
+          echo "distinct backends hit: $distinct"
+          [ "$distinct" -ge 3 ] || {
+            echo "::error::expected >=3 backends in rotation, saw $distinct"
+            exit 1
+          }
+
+      - name: Survives a backend crash
+        # Kills node-2 via its /crash endpoint, then checks the
+        # balancer keeps serving. This is the failover guarantee —
+        # if it ever breaks, this step is what tells you.
+        run: |
+          before=$(docker inspect -f '{{.RestartCount}}' node-2)
+
+          # Hit node-2 DIRECTLY on :3002. Going through the
+          # balancer would round-robin to whichever node is next,
+          # and only node-2 has a /crash endpoint.
+          curl -s -m 5 http://localhost:3002/crash || true
+          sleep 2
+
+          code=$(curl -s -o /dev/null -w '%{http_code}' -m 5 http://localhost:3000/)
+          echo "status during outage=$code"
+          [ "$code" = "200" ] || {
+            echo "::error::balancer returned $code while node-2 was down"
+            exit 1
+          }
+
+          # restart: unless-stopped should bring node-2 back on its own.
+          for i in $(seq 1 30); do
+            after=$(docker inspect -f '{{.RestartCount}}' node-2)
+            [ "$after" -gt "$before" ] && {
+              echo "node-2 auto-restarted ($before -> $after)"
+              exit 0
+            }
+            sleep 1
+          done
+          echo "::error::node-2 never restarted (RestartCount stayed at $before)"
+          exit 1
+
+      - name: Dump logs on failure
+        # `if: failure()` makes this run ONLY when a step above failed.
+        # Without it you are debugging a red build with no output.
+        if: failure()
+        run: |
+          docker compose ps
+          docker compose logs --tail 100
+
+      - name: Tear down
+        # `always()` runs this even on failure or cancellation.
+        if: always()
+        run: docker compose down -v
