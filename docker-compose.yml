@@ -20,6 +20,13 @@ services:
       - "27020:27017"
     networks:
       - lb-network
+    healthcheck:
+      test: ["CMD", "mongosh", "--quiet", "--eval", "db.adminCommand('ping')"]
+      interval: 5s
+      timeout: 5s
+      retries: 12
+      start_period: 10s
+
   node-1:
     image: node-1:latest
     container_name: node-1
@@ -28,9 +35,14 @@ services:
     networks:
       - lb-network
     depends_on:
-      - mongodb
+      # Wait for Mongo to actually answer, not just to have started.
+      mongodb:
+        condition: service_healthy
     environment:
-     MONGO_URL: ${MONGO_URL}
+      # Falls back to the compose-internal Mongo when MONGO_URL is
+      # not set — a fresh clone and CI have no .env file. A local
+      # .env still overrides this.
+      MONGO_URL: ${MONGO_URL:-mongodb://mongodb:27017/loadbalancer}
     restart: unless-stopped
     mem_limit: 512m
     healthcheck:
