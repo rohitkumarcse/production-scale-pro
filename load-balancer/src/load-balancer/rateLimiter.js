@@ -1,6 +1,10 @@
 const clients = new Map();
 
-const WINDOW_MS = 60 * 1000; // 1 minuteconst MAX_REQUESTS = 100000000000;// 100 requests per minute
+const WINDOW_MS = 60 * 1000; // 1 minute
+
+// Effectively disabled so load tests measure the balancer
+// rather than the limiter. Set to 100 for real rate limiting.
+const MAX_REQUESTS = 100000000000;
 
 function checkRateLimit(clientId) {
   const now = Date.now();

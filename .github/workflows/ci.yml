@@ -15,7 +15,36 @@ concurrency:
 
 jobs:
   # ==========================================================
-  # JOB 1 — per-package checks
+  # JOB 1 — lint
+  # ==========================================================
+  # This exists because `node --check` is not enough. A lost
+  # newline once turned `const MAX_REQUESTS = ...` into part of
+  # the comment above it — valid syntax, so --check passed, but
+  # every request crashed the balancer at runtime.
+  # ESLint's no-undef catches exactly that.
+  lint:
+    name: lint
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: package-lock.json
+
+      - name: Install lint tooling
+        run: npm ci
+
+      - name: Lint
+        run: npm run lint
+
+  # ==========================================================
+  # JOB 2 — per-package checks
   # ==========================================================
   # There is no package.json at the repo root, so there is no
   # single `npm ci` that works. A matrix runs these five packages
@@ -70,7 +99,7 @@ jobs:
         run: npm audit --audit-level=high || true
 
   # ==========================================================
-  # JOB 2 — build images and test the whole stack
+  # JOB 3 — build images and test the whole stack
   # ==========================================================
   # Build and integration live in ONE job on purpose. Every job
   # gets a fresh VM, so images built in another job would not
@@ -79,7 +108,7 @@ jobs:
   integration:
     name: integration
     runs-on: ubuntu-latest
-    needs: check          # only runs if all five checks passed
+    needs: [lint, check]  # only runs if lint and all five checks passed
     timeout-minutes: 15   # a hung compose stack should fail, not run forever
 
     steps:
@@ -123,7 +152,8 @@ jobs:
           exit 1
 
       - name: Wait for the balancer to accept traffic
-        # The load-balancer service has no healthcheck, so poll it.
+        # Compose reports the container healthy before it has
+        # necessarily served a real proxied request, so poll it.
         run: |
           for i in $(seq 1 40); do
             # Capture the actual status instead of using `curl -f`,

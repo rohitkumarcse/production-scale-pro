@@ -1,0 +1,11 @@
+{
+  "name": "production-scale-pro",
+  "private": true,
+  "description": "Repo-root tooling only. The runnable services each have their own package.json.",
+  "scripts": {
+    "lint": "eslint load-balancer/src services-instance"
+  },
+  "devDependencies": {
+    "eslint": "^9.15.0"
+  }
+}
