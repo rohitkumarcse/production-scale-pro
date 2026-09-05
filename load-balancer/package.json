@@ -1,0 +1,19 @@
+{
+  "name": "load-balancer",
+  "version": "1.0.0",
+  "description": "",
+  "license": "ISC",
+  "author": "",
+  "type": "commonjs",
+  "main": "index.js",
+  "scripts": {
+    "server": "node src/server.js",
+    "load-balancer": "nodemon src/load-balancer/proxy.js",
+    "dev": "nodemon src/server.js"
+  },
+  "dependencies": {
+    "express": "^5.2.1",
+    "morgan": "^1.12.0",
+    "nodemon": "^3.1.14"
+  }
+}
